@@ -74,7 +74,10 @@ async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: Socke
 
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
-    let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    //let addr = env::args().nth(1).unwrap_or_else(|| "0.0.0.0:8080".to_string());
+    //let addr = SocketAddr::from(([::0,0,0,0], 8080));
+
+    let addr = env::args().nth(1).unwrap_or_else(|| "[::]:8080".to_string());
 
     let state = PeerMap::new(Mutex::new(HashMap::new()));
 

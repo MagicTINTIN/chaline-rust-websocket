@@ -1,95 +1,72 @@
-//! A chat server that broadcasts a message to all connections.
-//!
-//! This is a simple line-based server which accepts WebSocket connections,
-//! reads lines from those connections, and broadcasts the lines to all other
-//! connected clients.
-//!
-//! You can test this out by running:
-//!
-//!     cargo run --example server 127.0.0.1:12345
-//!
-//! And then in another window run:
-//!
-//!     cargo run --example client ws://127.0.0.1:12345/
-//!
-//! You can run the second command in multiple windows and then chat between the
-//! two, seeing the messages from the other client as they're received. For all
-//! connected clients they'll all join the same room and see everyone else's
-//! messages.
-
-use std::{
-    collections::HashMap,
-    env,
-    io::Error as IoError,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
-
-use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
-
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::protocol::Message;
-
-type Tx = UnboundedSender<Message>;
-type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
-
-async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr) {
-    println!("Incoming TCP connection from: {}", addr);
-
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during the websocket handshake occurred");
-    println!("WebSocket connection established: {}", addr);
-
-    // Insert the write part of this peer to the peer map.
-    let (tx, rx) = unbounded();
-    peer_map.lock().unwrap().insert(addr, tx);
-
-    let (outgoing, incoming) = ws_stream.split();
-
-    let broadcast_incoming = incoming.try_for_each(|msg| {
-        println!("Received a message from {}: {}", addr, msg.to_text().unwrap());
-        let peers = peer_map.lock().unwrap();
-
-        // We want to broadcast the message to everyone except ourselves.
-        let broadcast_recipients =
-            peers.iter().filter(|(peer_addr, _)| peer_addr != &&addr).map(|(_, ws_sink)| ws_sink);
-
-        for recp in broadcast_recipients {
-            recp.unbounded_send(msg.clone()).unwrap();
-        }
-
-        future::ok(())
-    });
-
-    let receive_from_others = rx.map(Ok).forward(outgoing);
-
-    pin_mut!(broadcast_incoming, receive_from_others);
-    future::select(broadcast_incoming, receive_from_others).await;
-
-    println!("{} disconnected", &addr);
-    peer_map.lock().unwrap().remove(&addr);
-}
+use futures::{StreamExt, SinkExt};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::{ServerConfig, Certificate, PrivateKey};
+use tokio_tungstenite::accept_async;
+use rustls_pemfile::{certs, pkcs8_private_keys};
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> Result<(), IoError> {
-    //let addr = env::args().nth(1).unwrap_or_else(|| "0.0.0.0:8080".to_string());
-    //let addr = SocketAddr::from(([::0,0,0,0], 8080));
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // let cert_file = &mut BufReader::new(File::open("/etc/ssl/private/cloudflare_cert.pem")?);
+    // let key_file = &mut BufReader::new(File::open("/etc/ssl/private/cloudflare_key.pem")?);
+    let cert_file = &mut BufReader::new(File::open("/etc/ssl/private/mtc")?);
+    let key_file = &mut BufReader::new(File::open("/etc/ssl/private/mtk")?);
+    let cert_chain = certs(cert_file)?
+        .into_iter()
+        .map(Certificate)
+        .collect();
+    let mut keys = pkcs8_private_keys(key_file)?;
+    if keys.is_empty() {
+        return Err("No private key found".into());
+    }
 
-    let addr = env::args().nth(1).unwrap_or_else(|| "[::]:8080".to_string());
+    // TLS server
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, PrivateKey(keys.remove(0)))?;
+    let acceptor = TlsAcceptor::from(Arc::new(config));
 
-    let state = PeerMap::new(Mutex::new(HashMap::new()));
+    // start TCP listener
+    // let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    // println!("Listening on wss://0.0.0.0:8080");
+    let listener = TcpListener::bind("[::]:8443").await?;
+    println!("Listening on wss://[::]:8443");
 
-    // Create the event loop and TCP listener we'll accept connections on.
-    let try_socket = TcpListener::bind(&addr).await;
-    let listener = try_socket.expect("Failed to bind");
-    println!("Listening on: {}", addr);
+    while let Ok((stream, _)) = listener.accept().await {
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            // accept TLS connection
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(tls_stream) => tls_stream,
+                Err(err) => {
+                    eprintln!("TLS handshake failed: {}", err);
+                    return;
+                }
+            };
 
-    // Let's spawn the handling of each connection in a separate task.
-    while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(state.clone(), stream, addr));
+            // upgrade to a WebSocket connection
+            let ws_stream = accept_async(tls_stream).await.unwrap();
+            println!("New WebSocket connection established");
+
+            // handle incoming messages (echo them back)
+            let (mut write, mut read) = ws_stream.split();
+            while let Some(Ok(msg)) = read.next().await {
+                if let tokio_tungstenite::tungstenite::protocol::Message::Text(txt) = msg {
+                    println!("Received: {}", txt);
+                    write
+                        .send(tokio_tungstenite::tungstenite::protocol::Message::Text(txt))
+                        .await
+                        .unwrap();
+                }
+            }
+            println!("socket connection ended");
+        });
     }
 
     Ok(())
 }
+

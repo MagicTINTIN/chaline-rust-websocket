@@ -1,17 +1,16 @@
-use futures::{StreamExt, SinkExt};
+use futures::{SinkExt, StreamExt};
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::{ServerConfig, Certificate, PrivateKey};
 use tokio_tungstenite::accept_async;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let cert_file = &mut BufReader::new(File::open("/etc/ssl/private/cloudflare_cert.pem")?);
-    // let key_file = &mut BufReader::new(File::open("/etc/ssl/private/cloudflare_key.pem")?);
     let cert_file = &mut BufReader::new(File::open("/etc/ssl/private/mtc")?);
     let key_file = &mut BufReader::new(File::open("/etc/ssl/private/mtk")?);
     let cert_chain = certs(cert_file)?
@@ -30,14 +29,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_single_cert(cert_chain, PrivateKey(keys.remove(0)))?;
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
-    // start TCP listener
-    // let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    // println!("Listening on wss://0.0.0.0:8080");
+    // shared list of clients
+    let clients = Arc::new(Mutex::new(Vec::new()));
+
+    // TCP listener
     let listener = TcpListener::bind("[::]:8443").await?;
     println!("Listening on wss://[::]:8443");
 
     while let Ok((stream, _)) = listener.accept().await {
         let acceptor = acceptor.clone();
+        let clients = Arc::clone(&clients);
+
         tokio::spawn(async move {
             // accept TLS connection
             let tls_stream = match acceptor.accept(stream).await {
@@ -48,22 +50,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // upgrade to a WebSocket connection
-            let ws_stream = accept_async(tls_stream).await.unwrap();
+            // upgrade to WebSocket
+            let ws_stream = match accept_async(tls_stream).await {
+                Ok(ws) => ws,
+                Err(err) => {
+                    eprintln!("WebSocket handshake failed: {}", err);
+                    return;
+                }
+            };
             println!("New WebSocket connection established");
 
-            // handle incoming messages (echo them back)
+            // Split the WebSocket stream into read and write halves
             let (mut write, mut read) = ws_stream.split();
+
+            // add this client to the shared list
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            {
+                let mut clients_guard = clients.lock().unwrap();
+                clients_guard.push(tx);
+            }
+
+            // sending messages to the client
+            let send_task = tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    if write.send(msg).await.is_err() {
+                        break; // Client disconnected
+                    }
+                }
+            });
+
+            // receiving messages from the client
             while let Some(Ok(msg)) = read.next().await {
                 if let tokio_tungstenite::tungstenite::protocol::Message::Text(txt) = msg {
                     println!("Received: {}", txt);
-                    write
-                        .send(tokio_tungstenite::tungstenite::protocol::Message::Text(txt))
-                        .await
-                        .unwrap();
+                    if txt.contains("new micasend message") {
+                        println!("Broadcasting ping");
+
+                        // Broadcast to all clients
+                        let clients_guard = clients.lock().unwrap();
+                        for client in clients_guard.iter() {
+                            let _ = client.send(tokio_tungstenite::tungstenite::protocol::Message::Text(
+                                "new message notification".to_string(),
+                            ));
+                        }
+                    }
                 }
             }
-            println!("socket connection ended");
+
+            println!("Socket connection ended");
+
+            // remove the client from the shared list
+            {
+                let mut clients_guard = clients.lock().unwrap();
+                clients_guard.retain(|client| !client.is_closed());
+            }
+
+            // wait for the send task to finish
+            let _ = send_task.await;
         });
     }
 
